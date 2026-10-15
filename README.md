@@ -29,6 +29,7 @@ Stop the receiver with Ctrl+C. Audio is decoded in memory, never saved to disk.
 python mashin-py-cli.py --list-devices
 python mashin-py-cli.py 192.168.1.10:8095 --output-device 3
 python mashin-py-cli.py 192.168.1.10:8095 --device-id desktop --profile opus_192k
+python mashin-py-cli.py 192.168.1.10:8095 --codec opus --buffer-capacity 8 --debug
 python mashin-py-cli.py --help
 ```
 
@@ -37,13 +38,27 @@ python mashin-py-cli.py --help
 - `--name`: player name shown in MA.
 - `--device-id`: stable ASCII identity, defaulting to an ID derived from the hostname.
 	Keep it unchanged across reconnects; use separate IDs for simultaneous clients.
-- `--profile`: `flac` (default), `opus_96k`, `opus_128k`, `opus_192k`, or `opus_256k`.
+- `--codec` (alias `--profile`): `flac` (default), `opus_96k`, `opus_128k`,
+  `opus_192k`, or `opus_256k`. `opus` is shorthand for `opus_128k`.
+- `--buffer-capacity`: budget for original encoded server chunks in whole MiB,
+  minimum 1, default 4. Current and successor tracks share this budget, including
+  the chunk headers. Receipt ACKs confirm retained encoded bytes, not decoding.
+  Byte credits reflect available space, capped at the protocol's payload limit.
+  This is not a duration or prebuffer delay; server limits can constrain occupancy.
+  A decoder worker prepares at most two current-track chunks as a small PCM
+  working set for the sound device. Queued successor chunks remain encoded.
 - `--output-device`: device index or name substring; omitted uses the default output.
-- `--verbose`: diagnostic logging.
+- `--debug`: debug logging with handshake diagnostics and a buffer summary every
+    five seconds: occupied KiB, cached chunk count and remaining audio seconds.
+    Totals include current and successor tracks; duration excludes frames already
+    submitted to the audio device.
+- `--trace`: detailed chunk, decoding, buffer-credit, protocol and position logs;
+    includes all debug output. Without either flag, logging uses INFO for connection,
+    command, playback-state and error messages. `--verbose` is not supported.
 
 MA commands for pause, resume, stop, volume and mute are applied to local playback.
 The receiver reports DAC-based position and track completion, bounded buffer
-capacity and chunk receipts. It reconnects automatically, retaining buffered audio
+capacity and encoded-chunk receipts. It reconnects automatically, retaining buffered audio
 for up to 30 seconds after detecting a disconnect. Successor tracks are supported,
 but device reopening between tracks is not guaranteed gapless.
 

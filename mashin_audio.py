@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import io
+import logging
 import struct
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
@@ -17,8 +19,10 @@ import sounddevice as sd
 PROFILES = ("flac", "opus_96k", "opus_128k", "opus_192k", "opus_256k")
 HEADER = struct.Struct("!16sQQQB")
 MAX_PAYLOAD = 262144
-MAX_PCM = 4 * 1024 * 1024
-MAX_CHUNK_PCM = 48000 * 2 * 4
+DEFAULT_BUFFER_CAPACITY = 4 * 1024 * 1024
+DECODE_AHEAD_CHUNKS = 2
+LOGGER = logging.getLogger("mashin.audio")
+TRACE = 5
 
 
 class AudioError(ValueError):
@@ -36,9 +40,23 @@ class Chunk:
 
 
 @dataclass
+class EncodedChunk:
+    stream_id: str
+    index: int
+    first: int
+    count: int
+    final: bool
+    data: bytes
+
+
+@dataclass
 class Stream:
     descriptor: dict[str, Any]
-    chunks: deque[Chunk] = field(default_factory=deque)
+    chunks: deque[EncodedChunk] = field(default_factory=deque)
+    decoded: deque[Chunk] = field(default_factory=deque)
+    decoded_index: int = 0
+    decode_failed: bool = False
+    buffered_bytes: int = 0
     next_index: int = 1
     received_frames: int = 0
     rendered: int = 0
@@ -94,22 +112,31 @@ def stream_from(descriptor: dict[str, Any]) -> Stream:
     return Stream(descriptor)
 
 
-def decode_chunk(data: bytes, stream: Stream) -> Chunk:
-    """Decode one complete independent FLAC/Ogg mini-stream, including Opus pre-skip."""
+def parse_chunk(
+    data: bytes, stream: Stream, *, validate_order: bool = True
+) -> EncodedChunk:
+    """Validate chunk framing without decoding or changing the receipt cursor."""
     if not HEADER.size < len(data) <= HEADER.size + MAX_PAYLOAD:
         raise AudioError("Invalid audio message length")
     raw_id, index, first, count, final = HEADER.unpack_from(data)
     identifier = str(UUID(bytes=raw_id))
     if (
         identifier != stream.identifier
-        or index != stream.next_index
-        or first != stream.received_frames
+        or (validate_order and index != stream.next_index)
+        or (validate_order and first != stream.received_frames)
         or not 1 <= count <= stream.rate
         or final not in (0, 1)
         or (not final and count != stream.rate)
-        or stream.final
+        or (validate_order and stream.final)
     ):
         raise AudioError("Non-contiguous or invalid audio chunk")
+    return EncodedChunk(identifier, index, first, count, bool(final), data)
+
+
+def decode_chunk(data: bytes, stream: Stream, *, validate_order: bool = True) -> Chunk:
+    """Decode one complete independent FLAC/Ogg mini-stream, including Opus pre-skip."""
+    encoded = parse_chunk(data, stream, validate_order=validate_order)
+    count = encoded.count
     frames: list[np.ndarray] = []
     decoded_count = 0
     output = stream.descriptor["output_format"]
@@ -143,15 +170,29 @@ def decode_chunk(data: bytes, stream: Stream) -> Chunk:
     pcm = np.concatenate(frames).astype(np.float32, copy=False)
     if not np.isfinite(pcm).all():
         raise AudioError("Non-finite audio samples")
-    return Chunk(identifier, index, first, count, bool(final), pcm)
+    return Chunk(
+        encoded.stream_id, encoded.index, encoded.first, count, encoded.final, pcm
+    )
 
 
 class Output:
-    """Own one decoder queue and one PortAudio output stream."""
+    """Retain encoded chunks and decode a bounded working set for PortAudio."""
 
-    def __init__(self, device: str | int | None = None) -> None:
+    def __init__(
+        self,
+        device: str | int | None = None,
+        buffer_capacity: int = DEFAULT_BUFFER_CAPACITY,
+    ) -> None:
+        if buffer_capacity < HEADER.size + MAX_PAYLOAD:
+            raise AudioError(
+                "Chunk buffer must hold at least one maximum-size audio message"
+            )
         self.device = device
+        self.buffer_capacity = buffer_capacity
         self.lock = threading.RLock()
+        self.condition = threading.Condition(self.lock)
+        self.decoder: threading.Thread | None = None
+        self.decoder_stopping = False
         self.current: Stream | None = None
         self.next: Stream | None = None
         self.next_revision = 0
@@ -179,9 +220,24 @@ class Output:
             latency="low",
         )
         self.output.start()
+        LOGGER.info(
+            "Output opened: device=%s, rate=%s Hz, channels=%s",
+            sd.query_devices(self.output.device, "output")["name"],
+            stream.rate,
+            stream.channels,
+        )
+        with self.condition:
+            if self.decoder is None:
+                self.decoder_stopping = False
+                self.decoder = threading.Thread(
+                    target=self._decode_worker, name="mashin-decoder", daemon=True
+                )
+                self.decoder.start()
+            self.condition.notify_all()
 
     def load(self, descriptor: dict[str, Any], autoplay: bool) -> None:
         stream = stream_from(descriptor)
+        self._stop_decoder()
         self.close_device()
         with self.lock:
             self.current, self.next = stream, None
@@ -196,6 +252,7 @@ class Output:
             raise
 
     def stop(self) -> None:
+        self._stop_decoder()
         self.close_device()
         with self.lock:
             self.current = self.next = None
@@ -204,8 +261,9 @@ class Output:
             self.scheduled.clear()
 
     def set_playing(self, playing: bool) -> None:
-        with self.lock:
+        with self.condition:
             self.playing = playing
+            self.condition.notify_all()
         if self.output is not None:
             if playing:
                 if not self.output.active:
@@ -225,26 +283,142 @@ class Output:
             finally:
                 output.close()
 
-    def capacity(self) -> int:
+    def buffered_bytes(self) -> int:
         with self.lock:
-            used = sum(
-                chunk.pcm.nbytes
+            return sum(
+                stream.buffered_bytes
                 for stream in (self.current, self.next)
                 if stream is not None
-                for chunk in stream.chunks
             )
-            return MAX_PAYLOAD if used + MAX_CHUNK_PCM <= MAX_PCM else 0
 
-    def accept(self, stream: Stream, chunk: Chunk) -> None:
+    def buffer_stats(self) -> tuple[int, int, float]:
+        """Return cached wire bytes, chunk count and remaining output duration."""
         with self.lock:
+            streams = [
+                stream for stream in (self.current, self.next) if stream is not None
+            ]
+            chunks = sum(len(stream.chunks) for stream in streams)
+            seconds = sum(
+                sum(
+                    max(0, chunk.count - max(0, stream.rendered - chunk.first))
+                    for chunk in stream.chunks
+                )
+                / stream.rate
+                for stream in streams
+            )
+            return self.buffered_bytes(), chunks, seconds
+
+    def capacity(self) -> int:
+        with self.lock:
+            return max(
+                0,
+                min(
+                    MAX_PAYLOAD,
+                    self.buffer_capacity - self.buffered_bytes() - HEADER.size,
+                ),
+            )
+
+    def accept(self, stream: Stream, data: bytes) -> EncodedChunk:
+        with self.condition:
             if stream is not self.current and stream is not self.next:
-                raise AudioError("Stream was replaced while decoding")
-            if not self.capacity():
-                raise AudioError("PCM buffer is full")
+                raise AudioError("Stream was replaced before retaining the chunk")
+            chunk = parse_chunk(data, stream)
+            if len(data) - HEADER.size > self.capacity():
+                raise AudioError("Encoded chunk buffer is full")
             stream.chunks.append(chunk)
+            stream.buffered_bytes += len(data)
             stream.next_index += 1
             stream.received_frames += chunk.count
             stream.final = chunk.final
+            self.condition.notify_all()
+            return chunk
+
+    def prepare(self) -> bool:
+        """Decode at most one buffered chunk without changing receipt authority."""
+        with self.lock:
+            candidate = self._decode_candidate()
+            if candidate is None:
+                return False
+            stream, encoded = candidate
+        started = time.monotonic()
+        try:
+            decoded = decode_chunk(encoded.data, stream, validate_order=False)
+        except AudioError as failure:
+            with self.condition:
+                if self.current is stream:
+                    stream.decode_failed = True
+                    stream.error = {
+                        "code": "stream_failed",
+                        "message": "Buffered audio could not be decoded",
+                        "is_retryable": False,
+                        "retry_after_millis": None,
+                    }
+                    stream.chunks = deque(
+                        chunk
+                        for chunk in stream.chunks
+                        if chunk.index <= stream.decoded_index
+                    )
+                    stream.buffered_bytes = sum(
+                        len(chunk.data) for chunk in stream.chunks
+                    )
+                    self.condition.notify_all()
+            LOGGER.error(
+                "Buffered chunk decode failed: stream=%s index=%s: %s",
+                stream.identifier,
+                encoded.index,
+                failure,
+                exc_info=LOGGER.isEnabledFor(logging.DEBUG),
+            )
+            return False
+        with self.condition:
+            if self.current is stream and not stream.decode_failed:
+                stream.decoded.append(decoded)
+                stream.decoded_index = encoded.index
+                self.condition.notify_all()
+        LOGGER.log(
+            TRACE,
+            "Decoded for output: stream=%s index=%s frames=%s decode_ms=%.1f",
+            stream.identifier,
+            encoded.index,
+            decoded.count,
+            (time.monotonic() - started) * 1000,
+        )
+        return True
+
+    def _decode_candidate(self) -> tuple[Stream, EncodedChunk] | None:
+        stream = self.current
+        if (
+            stream is None
+            or not self.playing
+            or stream.decode_failed
+            or len(stream.decoded) >= DECODE_AHEAD_CHUNKS
+        ):
+            return None
+        encoded = next(
+            (chunk for chunk in stream.chunks if chunk.index > stream.decoded_index),
+            None,
+        )
+        return (stream, encoded) if encoded is not None else None
+
+    def _decode_worker(self) -> None:
+        while True:
+            with self.condition:
+                self.condition.wait_for(
+                    lambda: (
+                        self.decoder_stopping or self._decode_candidate() is not None
+                    )
+                )
+                if self.decoder_stopping:
+                    return
+            self.prepare()
+
+    def _stop_decoder(self) -> None:
+        with self.condition:
+            self.decoder_stopping = True
+            self.condition.notify_all()
+            decoder, self.decoder = self.decoder, None
+        if decoder is not None:
+            decoder.join()
 
     def cursors(self) -> list[dict[str, Any]]:
         with self.lock:
@@ -262,6 +436,7 @@ class Output:
                 if (
                     stream.error is not None
                     and not stream.chunks
+                    and not stream.decoded
                     and not self.scheduled
                 ):
                     state = "error"
@@ -269,7 +444,7 @@ class Output:
                     state = "ended"
                 elif not self.playing:
                     state = "paused"
-                elif stream.chunks or self.scheduled:
+                elif stream.decoded or self.scheduled:
                     state = "playing"
                 else:
                     state = "buffering"
@@ -301,6 +476,7 @@ class Output:
                 self.playing
                 and stream.final
                 and not stream.chunks
+                and not stream.decoded
                 and not self.scheduled
                 and not stream.ended
                 and stream.error is None
@@ -338,13 +514,13 @@ class Output:
         self, output: np.ndarray, count: int, clock: Any, status: Any
     ) -> None:
         output.fill(0)
-        with self.lock:
+        with self.condition:
             stream = self.current
             if stream is None or not self.playing or stream.ended:
                 return
             cursor = 0
-            while cursor < count and stream.chunks:
-                chunk = stream.chunks[0]
+            while cursor < count and stream.decoded:
+                chunk = stream.decoded[0]
                 offset = stream.rendered - chunk.first
                 take = min(count - cursor, chunk.count - offset)
                 gain = 0.0 if self.muted else self.volume / 100.0
@@ -361,6 +537,8 @@ class Output:
                 stream.rendered += take
                 cursor += take
                 if offset + take == chunk.count:
-                    stream.chunks.popleft()
+                    stream.decoded.popleft()
+                    stream.buffered_bytes -= len(stream.chunks.popleft().data)
+                    self.condition.notify_all()
             if status and not status.output_underflow:
                 self.failure = "Audio output reported a device error"

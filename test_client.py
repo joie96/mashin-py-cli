@@ -16,12 +16,13 @@ import numpy as np
 import sounddevice as sd
 from aiohttp import web
 from aiohttp.test_utils import TestServer
+
 from mashin_audio import (
+    DEFAULT_BUFFER_CAPACITY,
     HEADER,
-    MAX_PCM,
+    MAX_PAYLOAD,
     PROFILES,
     AudioError,
-    Chunk,
     Output,
     decode_chunk,
     stream_from,
@@ -79,10 +80,134 @@ def flac_chunk(stream, count=48000, final=True):
         for packet in encoder.encode(None):
             container.mux(packet)
     identifier = UUID(stream.identifier)
-    return HEADER.pack(identifier.bytes, 1, 0, count, int(final)) + target.getvalue()
+    return (
+        HEADER.pack(
+            identifier.bytes,
+            stream.next_index,
+            stream.received_frames,
+            count,
+            int(final),
+        )
+        + target.getvalue()
+    )
 
 
 class AudioTests(unittest.TestCase):
+    def test_decoder_worker_refills_and_releases_wire_bytes_then_stops(self):
+        output = Output()
+        device = Mock(time=0.0, active=True, device=0)
+        with (
+            unittest.mock.patch("mashin_audio.sd.check_output_settings"),
+            unittest.mock.patch("mashin_audio.sd.OutputStream", return_value=device),
+            unittest.mock.patch(
+                "mashin_audio.sd.query_devices", return_value={"name": "Test output"}
+            ),
+        ):
+            try:
+                output.load(descriptor(), False)
+                stream = output.current
+                for index in range(4):
+                    output.accept(stream, flac_chunk(stream, final=index == 3))
+                self.assertFalse(stream.decoded)
+                retained = output.buffered_bytes()
+                first_size = len(stream.chunks[0].data)
+                output.set_playing(True)
+                with output.condition:
+                    self.assertTrue(
+                        output.condition.wait_for(lambda: len(stream.decoded) == 2, 3)
+                    )
+                worker = output.decoder
+                output._callback(
+                    np.empty((48000, 2), np.float32),
+                    48000,
+                    SimpleNamespace(outputBufferDacTime=1.0),
+                    None,
+                )
+                with output.condition:
+                    self.assertTrue(
+                        output.condition.wait_for(lambda: stream.decoded_index == 3, 3)
+                    )
+                self.assertEqual(output.buffered_bytes(), retained - first_size)
+                self.assertEqual(len(stream.decoded), 2)
+                self.assertEqual(stream.next_index, 5)
+            finally:
+                output.stop()
+        self.assertFalse(worker.is_alive())
+        self.assertIsNone(output.decoder)
+        self.assertEqual(output.buffered_bytes(), 0)
+
+    def test_deferred_decode_failure_reports_error_not_natural_end(self):
+        output = Output()
+        output.current = stream = stream_from(descriptor())
+        output.output = Mock(time=2.0)
+        output.playing = True
+        data = (
+            HEADER.pack(UUID(stream.identifier).bytes, 1, 0, 48000, 1)
+            + b"invalid codec data"
+        )
+        output.accept(stream, data)
+        self.assertEqual(stream.next_index, 2)
+        with self.assertLogs("mashin.audio", level="ERROR"):
+            self.assertFalse(output.prepare())
+        self.assertEqual(output.snapshot()["output_state"], "error")
+        self.assertEqual(output.snapshot()["error"]["code"], "stream_failed")
+        self.assertEqual(output.poll(), [])
+
+    def test_buffered_chunks_can_decode_after_a_server_source_error(self):
+        output = Output()
+        output.current = stream = stream_from(descriptor())
+        output.accept(stream, flac_chunk(stream))
+        stream.error = client_module.protocol_error(
+            "stream_failed", "Source ended with an error"
+        )
+        output.playing = True
+        self.assertTrue(output.prepare())
+        self.assertEqual(len(stream.decoded), 1)
+
+    def test_capacity_counts_original_encoded_chunks_without_decoding(self):
+        size = HEADER.size + MAX_PAYLOAD
+        output = Output(buffer_capacity=2 * size)
+        output.current = stream = stream_from(descriptor())
+        with unittest.mock.patch(
+            "mashin_audio.decode_chunk",
+            side_effect=AssertionError("Receipt must not decode"),
+        ):
+            for _ in range(2):
+                data = (
+                    HEADER.pack(
+                        UUID(stream.identifier).bytes,
+                        stream.next_index,
+                        stream.received_frames,
+                        48000,
+                        0,
+                    )
+                    + b"x" * MAX_PAYLOAD
+                )
+                retained = output.accept(stream, data)
+                self.assertIs(retained.data, data)
+                self.assertFalse(hasattr(retained, "pcm"))
+        self.assertEqual(output.buffered_bytes(), 2 * size)
+        self.assertFalse(stream.decoded)
+        self.assertEqual(stream.next_index, 3)
+        self.assertEqual(output.capacity(), 0)
+        with self.assertRaises(AudioError):
+            Output(buffer_capacity=size - 1)
+
+    def test_decode_working_set_is_independent_of_chunk_buffer(self):
+        output = Output()
+        output.current = stream = stream_from(descriptor("opus_128k"))
+        for index in range(8):
+            output.accept(stream, flac_chunk(stream, final=index == 7))
+        self.assertFalse(output.prepare())
+        self.assertFalse(stream.decoded)
+        output.playing = True
+        self.assertTrue(output.prepare())
+        self.assertTrue(output.prepare())
+        self.assertFalse(output.prepare())
+        self.assertEqual(len(stream.decoded), 2)
+        self.assertEqual(len(stream.chunks), 8)
+        self.assertEqual(stream.next_index, 9)
+
     def test_all_opus_profiles_apply_preskip_and_final_trim(self):
         for profile in PROFILES[1:]:
             stream = stream_from(descriptor(profile))
@@ -93,22 +218,36 @@ class AudioTests(unittest.TestCase):
                         (count, 2),
                     )
 
-    def test_pcm_capacity_is_bounded(self):
+    def test_encoded_capacity_is_bounded_across_current_and_next(self):
         output = Output()
         output.current = stream = stream_from(descriptor())
-        while output.capacity():
-            chunk = Chunk(
-                stream.identifier,
-                stream.next_index,
-                stream.received_frames,
-                48000,
-                False,
-                np.zeros((48000, 2), np.float32),
+        output.next = following = stream_from(descriptor())
+        while output.capacity() == MAX_PAYLOAD:
+            stream = following if stream is output.current else output.current
+            data = (
+                HEADER.pack(
+                    UUID(stream.identifier).bytes,
+                    stream.next_index,
+                    stream.received_frames,
+                    48000,
+                    0,
+                )
+                + b"x" * MAX_PAYLOAD
             )
-            output.accept(stream, chunk)
-        self.assertLessEqual(sum(chunk.pcm.nbytes for chunk in stream.chunks), MAX_PCM)
+            output.accept(stream, data)
+        self.assertLessEqual(output.buffered_bytes(), DEFAULT_BUFFER_CAPACITY)
         with self.assertRaises(AudioError):
-            output.accept(stream, chunk)
+            data = (
+                HEADER.pack(
+                    UUID(stream.identifier).bytes,
+                    stream.next_index,
+                    stream.received_frames,
+                    48000,
+                    0,
+                )
+                + b"x" * MAX_PAYLOAD
+            )
+            output.accept(stream, data)
 
     def test_decode_final_flac_and_frame_count(self):
         stream = stream_from(descriptor())
@@ -129,7 +268,8 @@ class AudioTests(unittest.TestCase):
         output.current = stream
         output.playing = True
         output.output = Mock(time=10.0)
-        output.accept(stream, decode_chunk(flac_chunk(stream), stream))
+        output.accept(stream, flac_chunk(stream))
+        output.prepare()
         block = np.empty((48000, 2), dtype=np.float32)
         output._callback(block, 48000, SimpleNamespace(outputBufferDacTime=11.0), None)
         self.assertEqual(output.poll(), [])
@@ -144,6 +284,56 @@ class AudioTests(unittest.TestCase):
         self.assertEqual(output.poll(), [])
 
 
+class ArgumentTests(unittest.TestCase):
+    def test_explicit_debug_and_trace_flags(self):
+        normal = client_module.arguments(["localhost:8095"])
+        self.assertFalse(normal.debug)
+        self.assertFalse(normal.trace)
+        debug = client_module.arguments(["localhost:8095", "--debug"])
+        self.assertTrue(debug.debug)
+        self.assertFalse(debug.trace)
+        trace = client_module.arguments(["localhost:8095", "--trace"])
+        self.assertTrue(trace.debug)
+        self.assertTrue(trace.trace)
+        with (
+            self.assertRaises(SystemExit),
+            unittest.mock.patch("sys.stderr", io.StringIO()),
+        ):
+            client_module.arguments(["localhost:8095", "--verbose"])
+
+    def test_codec_alias_and_encoded_budget(self):
+        options = client_module.arguments(
+            ["localhost:8095", "--codec", "opus", "--buffer-capacity", "8"]
+        )
+        self.assertEqual(options.profile, "opus_128k")
+        self.assertEqual(
+            client_module.Client(options).output.buffer_capacity, 8 * 1024 * 1024
+        )
+        for profile in PROFILES:
+            with self.subTest(profile=profile):
+                self.assertEqual(
+                    client_module.arguments(
+                        ["localhost:8095", "--codec", profile]
+                    ).profile,
+                    profile,
+                )
+                self.assertEqual(
+                    client_module.arguments(
+                        ["localhost:8095", "--profile", profile]
+                    ).profile,
+                    profile,
+                )
+
+    def test_invalid_buffer_capacity(self):
+        for value in ("0", "-1", "1.5", "invalid"):
+            with (
+                self.subTest(value=value),
+                self.assertRaises(SystemExit),
+                unittest.mock.patch("sys.stderr", io.StringIO()),
+            ):
+                client_module.arguments(["localhost:8095", "--buffer-capacity", value])
+
+
 class FakeOutput(Output):
     def _open(self, stream):
         self.close_device()
@@ -151,11 +341,75 @@ class FakeOutput(Output):
 
 
 class CommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_command_and_state_logs(self):
+        client = client_module.Client(
+            client_module.arguments(["localhost:8095"]), FakeOutput()
+        )
+        client.send = AsyncMock()
+        with self.assertLogs("mashin", level="DEBUG") as captured:
+            await client.command(
+                "set_media", {"command_id": 1, "stream": descriptor(), "autoplay": True}
+            )
+            await client.state()
+        messages = "\n".join(captured.output)
+        self.assertIn("MA command: set_media id=1", messages)
+        self.assertIn("Media loaded: stream=", messages)
+        self.assertIn("Playback: state=buffering", messages)
+        self.assertNotIn("Playback position:", messages)
+
+    async def test_debug_buffer_summary_is_limited_to_five_seconds(self):
+        output = FakeOutput()
+        output.load(descriptor(), True)
+        current = output.current
+        output.accept(current, flac_chunk(current, final=False))
+        output.accept(current, flac_chunk(current, count=24000))
+        output.next = following = stream_from(descriptor())
+        following.descriptor["output_format"]["sample_rate_hz"] = 44100
+        data = (
+            HEADER.pack(UUID(following.identifier).bytes, 1, 0, 22050, 1)
+            + b"encoded fixture"
+        )
+        output.accept(following, data)
+        output.prepare()
+        output._callback(
+            np.empty((24000, 2), np.float32),
+            24000,
+            SimpleNamespace(outputBufferDacTime=1.0),
+            None,
+        )
+        client = client_module.Client(
+            client_module.arguments(["localhost:8095"]), output
+        )
+        client.last_buffer_summary = 0
+        with self.assertLogs("mashin", level="DEBUG") as captured:
+            for now in (0, 4.99, 5, 5.1, 9.99, 10):
+                client.log_buffer_summary(now)
+        self.assertEqual(len(captured.output), 2)
+        used, count, seconds = output.buffer_stats()
+        self.assertEqual(count, 3)
+        self.assertEqual(seconds, 1.5)
+        self.assertIn(
+            f"{used / 1024:.1f} / 4096.0 KiB occupied, 3 chunks cached, 1.50 s remaining",
+            captured.output[0],
+        )
+
+    async def test_trace_retains_position_details(self):
+        client = client_module.Client(
+            client_module.arguments(["localhost:8095", "--trace"]), FakeOutput()
+        )
+        self.assertTrue(client.arguments.debug)
+        client.send = AsyncMock()
+        with self.assertLogs("mashin", level=client_module.TRACE) as captured:
+            await client.state()
+            await client.state()
+        self.assertIn("TRACE:mashin:Playback position:", "\n".join(captured.output))
+
     async def test_pause_accounts_for_drained_frames_with_lagging_device_clock(self):
         output = FakeOutput()
         output.load(descriptor(), True)
         stream = output.current
-        output.accept(stream, decode_chunk(flac_chunk(stream), stream))
+        output.accept(stream, flac_chunk(stream))
+        output.prepare()
         output._callback(
             np.empty((48000, 2), np.float32),
             48000,
@@ -219,7 +473,8 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         output.next = following = stream_from(descriptor())
         output.next_revision = 3
         for stream in (current, following):
-            output.accept(stream, decode_chunk(flac_chunk(stream), stream))
+            output.accept(stream, flac_chunk(stream))
+        output.prepare()
         output._callback(
             np.empty((48000, 2), np.float32),
             48000,
@@ -275,6 +530,19 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
         hello = await connection.receive_json()
         self.hellos.append(hello)
         self.control = connection
+        if getattr(self, "reject_resume", False):
+            error = self.envelope(
+                "error",
+                {
+                    "error": client_module.protocol_error(
+                        "stale_playback", "Playback is no longer current"
+                    )
+                },
+            )
+            error["connection_epoch"] = None
+            await connection.send_json(error)
+            await connection.close()
+            return connection
         stream = self.output.current
         await connection.send_json(
             self.envelope(
@@ -340,6 +608,7 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_handshake_load_audio_and_audible_end(self):
         media = await self.load()
+        self.output.prepare()
         self.assertEqual(
             self.hellos[0]["payload"]["capabilities"]["audio_profiles"], list(PROFILES)
         )
@@ -356,6 +625,32 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ended["payload"]["stream_id"], media["stream_id"])
         state = await self.until("player_state")
         self.assertEqual(state["payload"]["position_frame"], 48000)
+
+    async def test_rejected_resume_discards_cache_and_allows_idle_reconnect(self):
+        await self.load(autoplay=False)
+        await self.client.control.close()
+        with self.assertRaises(ConnectionError):
+            await asyncio.wait_for(self.task, 5)
+        self.reject_resume = True
+        self.task = asyncio.create_task(self.client.connect(self.session))
+        with (
+            self.assertLogs("mashin", level="WARNING"),
+            self.assertRaisesRegex(
+                ConnectionError, "Server cannot resume retained playback"
+            ),
+        ):
+            await asyncio.wait_for(self.task, 5)
+        self.assertIsNone(self.output.current)
+        self.assertEqual(self.output.cursors(), [])
+        self.reject_resume = False
+        self.audio_open.clear()
+        self.epoch = str(uuid4())
+        self.task = asyncio.create_task(self.client.connect(self.session))
+        await asyncio.wait_for(self.audio_open.wait(), 5)
+        resume = self.hellos[-1]["payload"]["resume_state"]
+        self.assertIsNone(resume["current_stream_id"])
+        self.assertEqual(resume["output_state"], "idle")
+        self.assertEqual(resume["received_streams"], [])
 
     async def test_reconnect_retains_receipt_cursor_without_replaying(self):
         media = await self.load(autoplay=False)

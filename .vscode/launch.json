@@ -1,0 +1,80 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Mashin: FLAC",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/mashin-py-cli.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "args": [
+                "http://192.168.1.2:8095",
+                "--name", "Desktop SP",
+                "--codec", "flac",
+                "--buffer-capacity", "256",
+                "--debug"
+            ]
+        },
+        {
+            "name": "Mashin: Opus 96k",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/mashin-py-cli.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "args": [
+                "http://192.168.1.2:8095",
+                "--name", "Desktop SP",
+                "--codec", "opus_96k",
+                "--buffer-capacity", "256",
+                "--debug"
+            ]
+        },
+        {
+            "name": "Mashin: Opus 128k",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/mashin-py-cli.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "args": [
+                "http://192.168.1.2:8095",
+                "--name", "Desktop SP",
+                "--codec", "opus_128k",
+                "--buffer-capacity", "256",
+                "--debug"
+            ]
+        },
+        {
+            "name": "Mashin: Opus 192k",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/mashin-py-cli.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "args": [
+                "http://192.168.1.2:8095",
+                "--name", "Desktop SP",
+                "--codec", "opus_192k",
+                "--buffer-capacity", "256",
+                "--debug"
+            ]
+        },
+        {
+            "name": "Mashin: Opus 256k",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/mashin-py-cli.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "args": [
+                "http://192.168.1.2:8095",
+                "--name", "Desktop SP",
+                "--codec", "opus_256k",
+                "--buffer-capacity", "256",
+                "--debug"
+            ]
+        }
+    ]
+}

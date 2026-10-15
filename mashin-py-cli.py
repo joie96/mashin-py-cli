@@ -21,17 +21,19 @@ from uuid import NAMESPACE_DNS, UUID, uuid4, uuid5
 
 import aiohttp
 import sounddevice as sd
+
 from mashin_audio import (
     HEADER,
     MAX_PAYLOAD,
     PROFILES,
+    TRACE,
     AudioError,
     Output,
-    decode_chunk,
     stream_from,
 )
 
 LOGGER = logging.getLogger("mashin")
+logging.addLevelName(TRACE, "TRACE")
 COMMANDS = {
     "set_media",
     "prepare_next",
@@ -83,7 +85,9 @@ class Client:
         self, arguments: argparse.Namespace, output: Output | None = None
     ) -> None:
         self.arguments = arguments
-        self.output = output or Output(arguments.output_device)
+        self.output = output or Output(
+            arguments.output_device, arguments.buffer_capacity * 1024 * 1024
+        )
         self.control: aiohttp.ClientWebSocketResponse | None = None
         self.audio: aiohttp.ClientWebSocketResponse | None = None
         self.epoch: str | None = None
@@ -99,6 +103,8 @@ class Client:
         self.last_capacity: int | None = None
         self.output_lock = asyncio.Lock()
         self.disconnected_at: float | None = None
+        self.last_buffer_summary = time.monotonic()
+        self.last_state: tuple[Any, ...] | None = None
 
     async def operate(self, operation: Callable[..., Any], *args: Any) -> Any:
         task = asyncio.create_task(asyncio.to_thread(operation, *args))
@@ -141,6 +147,16 @@ class Client:
         }
 
     async def run(self) -> None:
+        LOGGER.info(
+            "Receiver starting: device_id=%s, name=%s, profile=%s, encoded chunk buffer=%.1f MiB, output=%s",
+            self.arguments.device_id,
+            self.arguments.name,
+            self.arguments.profile,
+            self.output.buffer_capacity / (1024 * 1024),
+            self.arguments.output_device
+            if self.arguments.output_device is not None
+            else "default",
+        )
         delay = 0.5
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=10)
         watchdog = asyncio.create_task(self.grace_loop())
@@ -166,9 +182,11 @@ class Client:
                             self.disconnected_at = time.monotonic()
                             delay = 0.5
                         LOGGER.warning(
-                            "Connection lost (%s); reconnecting in %.1f s",
+                            "Connection lost (%s: %s); reconnecting in %.1f s",
                             type(error).__name__,
+                            error,
                             delay,
+                            exc_info=self.arguments.debug,
                         )
                         await asyncio.sleep(delay)
                         delay = min(8, delay * 2)
@@ -176,6 +194,7 @@ class Client:
             watchdog.cancel()
             await asyncio.gather(watchdog, return_exceptions=True)
             await self.operate(self.output.stop)
+            LOGGER.info("Receiver stopped; audio device closed")
 
     async def grace_loop(self) -> None:
         while True:
@@ -195,9 +214,13 @@ class Client:
         self.acks.clear()
         self.ready.clear()
         self.last_capacity = None
+        self.last_state = None
         tasks: list[asyncio.Task[None]] = []
         ws_timeout = aiohttp.ClientWSTimeout(ws_close=2)
         try:
+            LOGGER.info(
+                "Connecting Control to %s", urlsplit(self.arguments.server).netloc
+            )
             self.control = await session.ws_connect(
                 self.arguments.server + "/mashin/v1/control",
                 autoping=False,
@@ -223,10 +246,12 @@ class Client:
                     "audio_profile": self.arguments.profile,
                 },
             )
+            LOGGER.debug("Hello sent: resume=%s", self.resume())
             async with asyncio.timeout(30):
                 envelope = await self.receive(self.control, welcome=True)
             if envelope["type"] == "error":
                 code = envelope["payload"]["error"]["code"]
+                LOGGER.warning("Server rejected hello: %s", code)
                 if code in (
                     "cache_unavailable",
                     "stale_playback",
@@ -318,9 +343,19 @@ class Client:
                     or (not welcome and envelope["connection_epoch"] != self.epoch)
                 ):
                     raise AudioError("Invalid server envelope or stale epoch")
+                LOGGER.log(
+                    TRACE,
+                    "Received %s on %s",
+                    envelope["type"],
+                    "Control" if connection is self.control else "Audio",
+                )
                 return envelope
             else:
-                raise ConnectionError("WebSocket closed or unexpected frame")
+                raise ConnectionError(
+                    f"{'Control' if connection is self.control else 'Audio'} WebSocket "
+                    f"frame={message.type.name}, close_code={connection.close_code}, "
+                    f"error={connection.exception()}"
+                )
 
     async def control_loop(self) -> None:
         assert self.control is not None
@@ -352,12 +387,23 @@ class Client:
             if previous[:2] != (kind, payload):
                 raise AudioError("Command ID reused with different contents")
             await self.send("command_ack", previous[2])
+            LOGGER.debug("Repeated command acknowledged: %s id=%s", kind, identifier)
             return
+        LOGGER.info("MA command: %s id=%s", kind, identifier)
         error = None
         try:
             if kind == "set_media":
                 await self.operate(
                     self.output.load, payload["stream"], payload["autoplay"]
+                )
+                output_format = payload["stream"]["output_format"]
+                LOGGER.info(
+                    "Media loaded: stream=%s, profile=%s, rate=%s Hz, channels=%s, autoplay=%s",
+                    payload["stream"]["stream_id"],
+                    output_format["profile_id"],
+                    output_format["sample_rate_hz"],
+                    output_format["channels"],
+                    payload["autoplay"],
                 )
             elif kind == "prepare_next":
                 stream = stream_from(payload["stream"])
@@ -425,6 +471,9 @@ class Client:
         if len(self.acks) > 32:
             self.acks.popitem(last=False)
         await self.send("command_ack", ack)
+        LOGGER.debug(
+            "Command result: %s id=%s status=%s", kind, identifier, ack["status"]
+        )
         if self.ready.is_set():
             await self.capacity(force=True)
         await self.state()
@@ -435,6 +484,7 @@ class Client:
         binding: str,
         timeout: aiohttp.ClientWSTimeout,
     ) -> None:
+        LOGGER.debug("Connecting Audio channel")
         self.audio = await session.ws_connect(
             self.arguments.server + "/mashin/v1/audio",
             autoping=False,
@@ -461,6 +511,7 @@ class Client:
             raise AudioError("Expected audio_ready")
         self.ready.set()
         self.disconnected_at = None
+        LOGGER.info("Audio channel ready: connection_id=%s", self.audio_id)
         await self.capacity(force=True)
         while True:
             message = await self.audio.receive()
@@ -470,7 +521,10 @@ class Client:
             if message.type == aiohttp.WSMsgType.PONG:
                 continue
             if message.type != aiohttp.WSMsgType.BINARY:
-                raise ConnectionError("Audio WebSocket closed")
+                raise ConnectionError(
+                    f"Audio WebSocket frame={message.type.name}, "
+                    f"close_code={self.audio.close_code}, error={self.audio.exception()}"
+                )
             data = message.data
             if not HEADER.size < len(data) <= HEADER.size + MAX_PAYLOAD:
                 raise AudioError("Invalid audio frame")
@@ -486,14 +540,36 @@ class Client:
                     None,
                 )
             if stream is None:
+                LOGGER.log(
+                    TRACE,
+                    "Discarding chunk for retired stream: stream=%s index=%s",
+                    stream_id,
+                    index,
+                )
                 continue
             error = None
             try:
-                chunk = await asyncio.to_thread(decode_chunk, data, stream)
-                self.output.accept(stream, chunk)
-            except AudioError:
+                chunk = self.output.accept(stream, data)
+                LOGGER.log(
+                    TRACE,
+                    "Encoded chunk retained: stream=%s index=%s frames=%s final=%s bytes=%s buffered_bytes=%s",
+                    stream_id,
+                    index,
+                    chunk.count,
+                    chunk.final,
+                    len(data),
+                    self.output.buffered_bytes(),
+                )
+            except AudioError as failure:
+                LOGGER.warning(
+                    "Audio chunk rejected: stream=%s index=%s: %s",
+                    stream_id,
+                    index,
+                    failure,
+                    exc_info=self.arguments.debug,
+                )
                 error = protocol_error(
-                    "stream_failed", "Audio chunk could not be decoded or retained"
+                    "stream_failed", "Audio chunk could not be validated or retained"
                 )
             await self.send(
                 "chunk_ack",
@@ -518,9 +594,52 @@ class Client:
                 sequence=True,
             )
             self.last_capacity = value
+            LOGGER.log(
+                TRACE,
+                "Buffer credit=%s payload bytes; encoded chunk budget=%s bytes; retained=%s bytes",
+                value,
+                self.output.buffer_capacity,
+                self.output.buffered_bytes(),
+            )
 
     async def state(self) -> None:
-        await self.send("player_state", self.output.snapshot(), sequence=True)
+        snapshot = self.output.snapshot()
+        await self.send("player_state", snapshot, sequence=True)
+        identity = tuple(
+            snapshot[key]
+            for key in ("stream_id", "output_state", "volume_percent", "is_muted")
+        )
+        if identity != self.last_state:
+            LOGGER.info(
+                "Playback: state=%s stream=%s position=%s frames volume=%s mute=%s",
+                snapshot["output_state"],
+                snapshot["stream_id"],
+                snapshot["position_frame"],
+                snapshot["volume_percent"],
+                snapshot["is_muted"],
+            )
+            self.last_state = identity
+        else:
+            LOGGER.log(
+                TRACE,
+                "Playback position: stream=%s frame=%s",
+                snapshot["stream_id"],
+                snapshot["position_frame"],
+            )
+
+    def log_buffer_summary(self, now: float) -> None:
+        if now - self.last_buffer_summary < 5:
+            return
+        self.last_buffer_summary = now
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            used, chunks, seconds = self.output.buffer_stats()
+            LOGGER.debug(
+                "Buffer: %.1f / %.1f KiB occupied, %s chunks cached, %.2f s remaining",
+                used / 1024,
+                self.output.buffer_capacity / 1024,
+                chunks,
+                seconds,
+            )
 
     async def report_loop(self) -> None:
         last_report = 0.0
@@ -531,11 +650,15 @@ class Client:
                 events = await self.operate(self.output.poll)
                 for kind, payload in events:
                     await self.send(kind, payload, sequence=True)
+                    LOGGER.info(
+                        "Playback event: %s stream=%s", kind, payload["stream_id"]
+                    )
                 if self.ready.is_set():
                     await self.capacity()
                 if events or time.monotonic() - last_report >= 1:
                     await self.state()
                     last_report = time.monotonic()
+                self.log_buffer_summary(time.monotonic())
             await asyncio.sleep(0.1)
 
     async def ping_loop(self) -> None:
@@ -547,6 +670,7 @@ class Client:
             async with asyncio.timeout(15):
                 await self.control.ping(self.ping_payload)
                 await self.pong.wait()
+            LOGGER.log(TRACE, "Control ping acknowledged")
 
 
 def arguments(argv: list[str] | None = None) -> argparse.Namespace:
@@ -570,10 +694,19 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         help="Player name shown in MA",
     )
     parser.add_argument(
+        "--codec",
         "--profile",
-        choices=PROFILES,
+        dest="profile",
+        choices=("opus", *PROFILES),
         default="flac",
-        help="Audio profile (default: flac)",
+        help="Codec/profile (default: flac; opus selects opus_128k); --profile is an alias",
+    )
+    parser.add_argument(
+        "--buffer-capacity",
+        type=int,
+        default=4,
+        metavar="MiB",
+        help="Encoded server-chunk buffer budget in MiB, minimum 1 (default: 4)",
     )
     parser.add_argument(
         "--output-device",
@@ -583,11 +716,23 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         "--list-devices", action="store_true", help="List local audio devices and exit"
     )
     parser.add_argument(
-        "--verbose", action="store_true", help="Enable diagnostic logging"
+        "--debug",
+        action="store_true",
+        help="Enable debug logging with a buffer summary every five seconds",
+    )
+    parser.add_argument(
+        "--trace",
+        action="store_true",
+        help="Include per-chunk and protocol logging (implies --debug)",
     )
     result = parser.parse_args(argv)
+    result.debug = result.debug or result.trace
     if not result.server and not result.list_devices:
         parser.error("a server URL is required unless --list-devices is used")
+    if result.buffer_capacity < 1:
+        parser.error("--buffer-capacity must be at least 1 MiB")
+    if result.profile == "opus":
+        result.profile = "opus_128k"
     if (
         not result.device_id
         or not result.device_id.isascii()
@@ -602,8 +747,12 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
 def main() -> None:
     options = arguments()
     logging.basicConfig(
-        level=logging.DEBUG if options.verbose else logging.INFO,
-        format="%(levelname)s: %(message)s",
+        level=TRACE
+        if options.trace
+        else logging.DEBUG
+        if options.debug
+        else logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
     if options.list_devices:
         print(sd.query_devices())
