@@ -341,6 +341,147 @@ class FakeOutput(Output):
 
 
 class CommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_connection_failures_log_without_tracebacks(self):
+        for flag in ("--debug", "--trace"):
+            with self.subTest(flag=flag):
+                client = client_module.Client(
+                    client_module.arguments(["localhost:8095", flag]), FakeOutput()
+                )
+                client.connect = AsyncMock(
+                    side_effect=[
+                        aiohttp.ClientConnectionError("Network unreachable"),
+                        TimeoutError(),
+                        asyncio.CancelledError(),
+                    ]
+                )
+                client.buffer_loop = AsyncMock()
+                with (
+                    unittest.mock.patch.object(
+                        client_module.asyncio, "sleep", new_callable=AsyncMock
+                    ),
+                    self.assertLogs("mashin", level="WARNING") as captured,
+                    self.assertRaises(asyncio.CancelledError),
+                ):
+                    await client.run()
+                self.assertEqual(len(captured.records), 2)
+                self.assertTrue(
+                    all(record.exc_info is None for record in captured.records)
+                )
+                self.assertIn("reconnecting in 0.5 s", captured.output[0])
+                self.assertIn("reconnecting in 1.0 s", captured.output[1])
+
+    async def test_disconnected_buffer_keeps_playing_after_thirty_seconds(self):
+        output = FakeOutput()
+        output.load(descriptor(), True)
+        stream = output.current
+        output.accept(stream, flac_chunk(stream, final=False))
+        output.accept(stream, flac_chunk(stream))
+        output.prepare()
+        client = client_module.Client(
+            client_module.arguments(["localhost:8095", "--debug"]), output
+        )
+        client.disconnected_at = 0
+        client.last_buffer_summary = 0
+        client.operate = AsyncMock(
+            side_effect=lambda operation, *args: operation(*args)
+        )
+        clock = Mock(return_value=0)
+
+        async def tick(_delay):
+            if clock.return_value >= 40:
+                raise asyncio.CancelledError()
+            if clock.return_value == 35:
+                output._callback(
+                    np.empty((48000, 2), np.float32),
+                    48000,
+                    SimpleNamespace(outputBufferDacTime=1.0),
+                    None,
+                )
+            clock.return_value = 35 if clock.return_value == 0 else 40
+
+        with (
+            unittest.mock.patch.object(
+                client_module.asyncio, "sleep", side_effect=tick
+            ),
+            unittest.mock.patch.object(client_module.time, "monotonic", clock),
+            self.assertLogs("mashin", level="DEBUG") as captured,
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            await client.buffer_loop()
+        self.assertIsNone(client.control)
+        self.assertIs(output.current, stream)
+        self.assertTrue(output.playing)
+        self.assertEqual(client.disconnected_at, 0)
+        self.assertEqual(len(captured.output), 2)
+        self.assertIn("2 chunks cached, 2.00 s remaining", captured.output[0])
+        self.assertIn("1 chunks cached, 1.00 s remaining", captured.output[1])
+
+    async def test_reconnect_backoff_stays_at_eight_seconds(self):
+        client = client_module.Client(
+            client_module.arguments(["localhost:8095"]), FakeOutput()
+        )
+        client.connect = AsyncMock(
+            side_effect=[ConnectionError("Offline") for _ in range(9)]
+            + [asyncio.CancelledError()]
+        )
+        client.buffer_loop = AsyncMock()
+        with (
+            unittest.mock.patch.object(
+                client_module.asyncio, "sleep", new_callable=AsyncMock
+            ) as sleep,
+            self.assertLogs("mashin", level="WARNING"),
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            await client.run()
+        delays = [call.args[0] for call in sleep.await_args_list]
+        self.assertEqual(delays, [0.5, 1, 2, 4, 8, 8, 8, 8, 8])
+        self.assertGreater(sum(delays), 30)
+
+    async def test_offline_buffer_drains_current_and_authorized_successor(self):
+        output = FakeOutput()
+        output.load(descriptor(), True)
+        current = output.current
+        output.next = following = stream_from(descriptor())
+        output.next_revision = 1
+        for stream in (current, following):
+            output.accept(stream, flac_chunk(stream))
+        client = client_module.Client(
+            client_module.arguments(["localhost:8095"]), output
+        )
+        client.disconnected_at = 0
+        ticks = 0
+
+        async def tick(_delay):
+            nonlocal ticks
+            if ticks == 2:
+                raise asyncio.CancelledError()
+            output.prepare()
+            output._callback(
+                np.empty((48000, 2), np.float32),
+                48000,
+                SimpleNamespace(outputBufferDacTime=float(ticks)),
+                None,
+            )
+            ticks += 1
+            output.output.time = float(ticks)
+
+        with (
+            unittest.mock.patch.object(
+                client_module.asyncio, "sleep", side_effect=tick
+            ),
+            self.assertLogs("mashin", level="INFO") as captured,
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            await client.buffer_loop()
+        self.assertIs(output.current, following)
+        self.assertIsNone(output.next)
+        self.assertTrue(following.ended)
+        self.assertEqual(following.position, 48000)
+        self.assertEqual(output.buffered_bytes(), 0)
+        messages = "\n".join(captured.output)
+        self.assertIn("Offline playback event: track_started", messages)
+        self.assertEqual(messages.count("Offline playback event: track_ended"), 2)
+
     async def test_command_and_state_logs(self):
         client = client_module.Client(
             client_module.arguments(["localhost:8095"]), FakeOutput()

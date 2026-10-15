@@ -51,15 +51,23 @@ python mashin-py-cli.py --help
 - `--debug`: debug logging with handshake diagnostics and a buffer summary every
     five seconds: occupied KiB, cached chunk count and remaining audio seconds.
     Totals include current and successor tracks; duration excludes frames already
-    submitted to the audio device.
+    submitted to the audio device. Summaries continue during connection loss and
+    reconnect attempts.
 - `--trace`: detailed chunk, decoding, buffer-credit, protocol and position logs;
     includes all debug output. Without either flag, logging uses INFO for connection,
     command, playback-state and error messages. `--verbose` is not supported.
+    Expected connection failures and timeouts produce concise warnings without
+    stack traces at either logging level.
 
 MA commands for pause, resume, stop, volume and mute are applied to local playback.
 The receiver reports DAC-based position and track completion, bounded buffer
-capacity and encoded-chunk receipts. It reconnects automatically, retaining buffered audio
-for up to 30 seconds after detecting a disconnect. Successor tracks are supported,
+capacity and encoded-chunk receipts. It reconnects automatically with backoff from
+0.5 seconds up to 8 seconds, staying at that ceiling until the connection recovers.
+Already buffered audio plays to completion without a disconnect time limit,
+including an already authorized cached successor. Reconnect attempts do not clear
+the buffer or restart the backoff. Incomplete streams wait for more data when the
+buffer runs out; missing data is not treated as a natural track end.
+Successor tracks are supported,
 but device reopening between tracks is not guaranteed gapless.
 
 The Mashin endpoints are token-free and intended for a trusted LAN. Do not expose

@@ -159,7 +159,7 @@ class Client:
         )
         delay = 0.5
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=10)
-        watchdog = asyncio.create_task(self.grace_loop())
+        monitor = asyncio.create_task(self.buffer_loop())
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 while True:
@@ -186,27 +186,28 @@ class Client:
                             type(error).__name__,
                             error,
                             delay,
-                            exc_info=self.arguments.debug,
                         )
                         await asyncio.sleep(delay)
                         delay = min(8, delay * 2)
         finally:
-            watchdog.cancel()
-            await asyncio.gather(watchdog, return_exceptions=True)
+            monitor.cancel()
+            await asyncio.gather(monitor, return_exceptions=True)
             await self.operate(self.output.stop)
             LOGGER.info("Receiver stopped; audio device closed")
 
-    async def grace_loop(self) -> None:
+    async def buffer_loop(self) -> None:
         while True:
             await asyncio.sleep(0.25)
-            if (
-                self.disconnected_at is not None
-                and time.monotonic() - self.disconnected_at >= 30
-            ):
-                LOGGER.warning("Reconnect grace expired; stopping retained playback")
+            if self.disconnected_at is not None:
                 async with self.output_lock:
-                    await self.operate(self.output.stop)
-                self.disconnected_at = None
+                    events = await self.operate(self.output.poll)
+                for kind, payload in events:
+                    LOGGER.info(
+                        "Offline playback event: %s stream=%s",
+                        kind,
+                        payload["stream_id"],
+                    )
+            self.log_buffer_summary(time.monotonic())
 
     async def connect(self, session: aiohttp.ClientSession) -> None:
         await self.operate(self.output.poll)
@@ -658,7 +659,6 @@ class Client:
                 if events or time.monotonic() - last_report >= 1:
                     await self.state()
                     last_report = time.monotonic()
-                self.log_buffer_summary(time.monotonic())
             await asyncio.sleep(0.1)
 
     async def ping_loop(self) -> None:
