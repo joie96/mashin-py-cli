@@ -1,0 +1,4 @@
+aiohttp>=3.12,<4
+av>=19,<20
+numpy>=2,<3
+sounddevice>=0.5.6,<0.6
