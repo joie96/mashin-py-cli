@@ -93,6 +93,31 @@ def flac_chunk(stream, count=48000, final=True):
 
 
 class AudioTests(unittest.TestCase):
+    def test_manual_activation_retains_cache_and_rejects_stale_grants(self):
+        output = Output()
+        current = stream_from(descriptor())
+        successor = stream_from(descriptor())
+        output.current, output.next, output.next_revision = current, successor, 1
+        data = flac_chunk(successor)
+        output.accept(successor, data)
+        cache = successor.chunks
+        cursor = successor.next_index
+        with unittest.mock.patch.object(output, "_open"):
+            with self.assertRaises(AudioError):
+                output.activate_prepared(current.identifier, successor.identifier, 2)
+            self.assertIs(output.current, current)
+            output.activate_prepared(current.identifier, successor.identifier, 1)
+            self.assertIs(output.current, successor)
+            self.assertIs(successor.chunks, cache)
+            self.assertEqual(successor.next_index, cursor)
+            self.assertIsNone(output.next)
+            self.assertEqual(output.activation.previous_stream_id, current.identifier)
+            successor.position = 100
+            output.activate_prepared(current.identifier, successor.identifier, 1)
+            self.assertEqual(successor.position, 100)
+        output.stop()
+        self.assertIsNone(output.activation)
+
     def test_decoder_worker_refills_and_releases_wire_bytes_then_stops(self):
         output = Output()
         device = Mock(time=0.0, active=True, device=0)
@@ -113,9 +138,7 @@ class AudioTests(unittest.TestCase):
                 first_size = len(stream.chunks[0].data)
                 output.set_playing(True)
                 with output.condition:
-                    self.assertTrue(
-                        output.condition.wait_for(lambda: len(stream.decoded) == 2, 3)
-                    )
+                    self.assertTrue(output.condition.wait_for(lambda: len(stream.decoded) == 2, 3))
                 worker = output.decoder
                 output._callback(
                     np.empty((48000, 2), np.float32),
@@ -124,9 +147,7 @@ class AudioTests(unittest.TestCase):
                     None,
                 )
                 with output.condition:
-                    self.assertTrue(
-                        output.condition.wait_for(lambda: stream.decoded_index == 3, 3)
-                    )
+                    self.assertTrue(output.condition.wait_for(lambda: stream.decoded_index == 3, 3))
                 self.assertEqual(output.buffered_bytes(), retained - first_size)
                 self.assertEqual(len(stream.decoded), 2)
                 self.assertEqual(stream.next_index, 5)
@@ -141,10 +162,7 @@ class AudioTests(unittest.TestCase):
         output.current = stream = stream_from(descriptor())
         output.output = Mock(time=2.0)
         output.playing = True
-        data = (
-            HEADER.pack(UUID(stream.identifier).bytes, 1, 0, 48000, 1)
-            + b"invalid codec data"
-        )
+        data = HEADER.pack(UUID(stream.identifier).bytes, 1, 0, 48000, 1) + b"invalid codec data"
         output.accept(stream, data)
         self.assertEqual(stream.next_index, 2)
         with self.assertLogs("mashin.audio", level="ERROR"):
@@ -157,9 +175,7 @@ class AudioTests(unittest.TestCase):
         output = Output()
         output.current = stream = stream_from(descriptor())
         output.accept(stream, flac_chunk(stream))
-        stream.error = client_module.protocol_error(
-            "stream_failed", "Source ended with an error"
-        )
+        stream.error = client_module.protocol_error("stream_failed", "Source ended with an error")
         output.playing = True
         self.assertTrue(output.prepare())
         self.assertEqual(len(stream.decoded), 1)
@@ -278,9 +294,7 @@ class AudioTests(unittest.TestCase):
         self.assertEqual(output.poll(), [])
         self.assertEqual(stream.position, 24000)
         output.output.time = 12.0
-        self.assertEqual(
-            output.poll(), [("track_ended", {"stream_id": stream.identifier})]
-        )
+        self.assertEqual(output.poll(), [("track_ended", {"stream_id": stream.identifier})])
         self.assertEqual(output.poll(), [])
 
 
@@ -306,21 +320,15 @@ class ArgumentTests(unittest.TestCase):
             ["localhost:8095", "--codec", "opus", "--buffer-capacity", "8"]
         )
         self.assertEqual(options.profile, "opus_128k")
-        self.assertEqual(
-            client_module.Client(options).output.buffer_capacity, 8 * 1024 * 1024
-        )
+        self.assertEqual(client_module.Client(options).output.buffer_capacity, 8 * 1024 * 1024)
         for profile in PROFILES:
             with self.subTest(profile=profile):
                 self.assertEqual(
-                    client_module.arguments(
-                        ["localhost:8095", "--codec", profile]
-                    ).profile,
+                    client_module.arguments(["localhost:8095", "--codec", profile]).profile,
                     profile,
                 )
                 self.assertEqual(
-                    client_module.arguments(
-                        ["localhost:8095", "--profile", profile]
-                    ).profile,
+                    client_module.arguments(["localhost:8095", "--profile", profile]).profile,
                     profile,
                 )
 
@@ -364,9 +372,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
                 ):
                     await client.run()
                 self.assertEqual(len(captured.records), 2)
-                self.assertTrue(
-                    all(record.exc_info is None for record in captured.records)
-                )
+                self.assertTrue(all(record.exc_info is None for record in captured.records))
                 self.assertIn("reconnecting in 0.5 s", captured.output[0])
                 self.assertIn("reconnecting in 1.0 s", captured.output[1])
 
@@ -382,9 +388,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         )
         client.disconnected_at = 0
         client.last_buffer_summary = 0
-        client.operate = AsyncMock(
-            side_effect=lambda operation, *args: operation(*args)
-        )
+        client.operate = AsyncMock(side_effect=lambda operation, *args: operation(*args))
         clock = Mock(return_value=0)
 
         async def tick(_delay):
@@ -400,9 +404,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             clock.return_value = 35 if clock.return_value == 0 else 40
 
         with (
-            unittest.mock.patch.object(
-                client_module.asyncio, "sleep", side_effect=tick
-            ),
+            unittest.mock.patch.object(client_module.asyncio, "sleep", side_effect=tick),
             unittest.mock.patch.object(client_module.time, "monotonic", clock),
             self.assertLogs("mashin", level="DEBUG") as captured,
             self.assertRaises(asyncio.CancelledError),
@@ -417,12 +419,9 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1 chunks cached, 1.00 s remaining", captured.output[1])
 
     async def test_reconnect_backoff_stays_at_eight_seconds(self):
-        client = client_module.Client(
-            client_module.arguments(["localhost:8095"]), FakeOutput()
-        )
+        client = client_module.Client(client_module.arguments(["localhost:8095"]), FakeOutput())
         client.connect = AsyncMock(
-            side_effect=[ConnectionError("Offline") for _ in range(9)]
-            + [asyncio.CancelledError()]
+            side_effect=[ConnectionError("Offline") for _ in range(9)] + [asyncio.CancelledError()]
         )
         client.buffer_loop = AsyncMock()
         with (
@@ -445,9 +444,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         output.next_revision = 1
         for stream in (current, following):
             output.accept(stream, flac_chunk(stream))
-        client = client_module.Client(
-            client_module.arguments(["localhost:8095"]), output
-        )
+        client = client_module.Client(client_module.arguments(["localhost:8095"]), output)
         client.disconnected_at = 0
         ticks = 0
 
@@ -466,9 +463,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             output.output.time = float(ticks)
 
         with (
-            unittest.mock.patch.object(
-                client_module.asyncio, "sleep", side_effect=tick
-            ),
+            unittest.mock.patch.object(client_module.asyncio, "sleep", side_effect=tick),
             self.assertLogs("mashin", level="INFO") as captured,
             self.assertRaises(asyncio.CancelledError),
         ):
@@ -483,9 +478,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(messages.count("Offline playback event: track_ended"), 2)
 
     async def test_command_and_state_logs(self):
-        client = client_module.Client(
-            client_module.arguments(["localhost:8095"]), FakeOutput()
-        )
+        client = client_module.Client(client_module.arguments(["localhost:8095"]), FakeOutput())
         client.send = AsyncMock()
         with self.assertLogs("mashin", level="DEBUG") as captured:
             await client.command(
@@ -506,10 +499,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         output.accept(current, flac_chunk(current, count=24000))
         output.next = following = stream_from(descriptor())
         following.descriptor["output_format"]["sample_rate_hz"] = 44100
-        data = (
-            HEADER.pack(UUID(following.identifier).bytes, 1, 0, 22050, 1)
-            + b"encoded fixture"
-        )
+        data = HEADER.pack(UUID(following.identifier).bytes, 1, 0, 22050, 1) + b"encoded fixture"
         output.accept(following, data)
         output.prepare()
         output._callback(
@@ -518,9 +508,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             SimpleNamespace(outputBufferDacTime=1.0),
             None,
         )
-        client = client_module.Client(
-            client_module.arguments(["localhost:8095"]), output
-        )
+        client = client_module.Client(client_module.arguments(["localhost:8095"]), output)
         client.last_buffer_summary = 0
         with self.assertLogs("mashin", level="DEBUG") as captured:
             for now in (0, 4.99, 5, 5.1, 9.99, 10):
@@ -565,9 +553,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_device_open_rejects_load_and_releases_stream(self):
         output = FakeOutput()
         output._open = Mock(side_effect=sd.PortAudioError("No output available"))
-        client = client_module.Client(
-            client_module.arguments(["localhost:8095"]), output
-        )
+        client = client_module.Client(client_module.arguments(["localhost:8095"]), output)
         client.send = AsyncMock()
         with self.assertLogs("mashin", level="ERROR"):
             await client.command(
@@ -577,11 +563,53 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(output.current)
         self.assertEqual(output.snapshot()["output_state"], "idle")
 
+    async def test_activation_reports_receipt_before_b_state_and_resumes_it(self):
+        output = FakeOutput()
+        output.load(descriptor(), True)
+        current = output.current
+        output.next = successor = stream_from(descriptor())
+        output.next_revision = 1
+        output.accept(successor, flac_chunk(successor))
+        client = client_module.Client(client_module.arguments(["localhost:8095"]), output)
+        client.send = AsyncMock()
+        await client.command(
+            "activate_prepared",
+            {
+                "command_id": 1,
+                "current_stream_id": current.identifier,
+                "stream_id": successor.identifier,
+                "next_revision": 1,
+            },
+        )
+        self.assertEqual(
+            [call.args[0] for call in client.send.await_args_list],
+            [
+                "command_ack",
+                "prepared_activated",
+                "player_state",
+            ],
+        )
+        receipt = client.send.await_args_list[1].args[1]["activation"]
+        self.assertEqual(receipt["previous_stream_id"], current.identifier)
+        self.assertEqual(receipt["stream_id"], successor.identifier)
+        self.assertEqual(client.resume()["activation"], receipt)
+        self.assertIs(output.current, successor)
+        await client.command(
+            "activate_prepared",
+            {
+                "command_id": 2,
+                "current_stream_id": current.identifier,
+                "stream_id": successor.identifier,
+                "next_revision": 1,
+            },
+        )
+        self.assertIs(output.current, successor)
+        self.assertEqual(client.resume()["activation"], receipt)
+        output.stop()
+
     async def test_commands_and_duplicate_load(self):
         output = FakeOutput()
-        client = client_module.Client(
-            client_module.arguments(["localhost:8095"]), output
-        )
+        client = client_module.Client(client_module.arguments(["localhost:8095"]), output)
         client.send = AsyncMock()
         client.ready.set()
         media = {"command_id": 1, "stream": descriptor(), "autoplay": True}
@@ -623,9 +651,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             None,
         )
         output.output.time = 2.0
-        self.assertEqual(
-            [kind for kind, _ in output.poll()], ["track_ended", "track_started"]
-        )
+        self.assertEqual([kind for kind, _ in output.poll()], ["track_ended", "track_started"])
         self.assertIs(output.current, following)
         self.assertEqual(output.snapshot()["position_frame"], 0)
 
@@ -658,7 +684,7 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
 
     def envelope(self, kind, payload):
         return {
-            "protocol_version": 1,
+            "protocol_version": 2,
             "type": kind,
             "message_id": str(uuid4()),
             "connection_epoch": self.epoch,
@@ -776,9 +802,7 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
         self.task = asyncio.create_task(self.client.connect(self.session))
         with (
             self.assertLogs("mashin", level="WARNING"),
-            self.assertRaisesRegex(
-                ConnectionError, "Server cannot resume retained playback"
-            ),
+            self.assertRaisesRegex(ConnectionError, "Server cannot resume retained playback"),
         ):
             await asyncio.wait_for(self.task, 5)
         self.assertIsNone(self.output.current)
@@ -809,9 +833,7 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
             self.hellos[-1]["payload"]["resume_state"]["received_streams"],
             [{"stream_id": media["stream_id"], "next_chunk_index": 2}],
         )
-        self.assertEqual(
-            self.audio_hello["payload"]["received_streams"], self.output.cursors()
-        )
+        self.assertEqual(self.audio_hello["payload"]["received_streams"], self.output.cursors())
         self.assertEqual(self.output.snapshot()["output_state"], "paused")
 
 

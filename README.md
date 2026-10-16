@@ -7,6 +7,10 @@ registered player in Music Assistant; there are no local playback controls.
 ## Install and Run
 
 Requires Python 3.12+ and a Music Assistant server with the Mashin provider enabled.
+The client uses Mashin control protocol V2. Update the provider and all clients
+together; V1 peers are rejected. A prepared successor is activated in place on
+MA Next, preserving its encoded cache and receipt cursor. An activation receipt
+survives reconnect so a lost command ACK cannot cause a second skip.
 Run these commands in this repository:
 
 ```console

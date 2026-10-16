@@ -2,7 +2,7 @@
 # requires-python = ">=3.12"
 # dependencies = ["aiohttp>=3.12,<4", "av>=19,<20", "numpy>=2,<3", "sounddevice>=0.5.6,<0.6"]
 # ///
-"""Mashin V1 console receiver. Playback is controlled exclusively through MA."""
+"""Mashin V2 console receiver. Playback is controlled exclusively through MA."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ import socket
 import time
 from collections import OrderedDict
 from collections.abc import Callable
+from dataclasses import asdict
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 from uuid import NAMESPACE_DNS, UUID, uuid4, uuid5
@@ -33,10 +34,12 @@ from mashin_audio import (
 )
 
 LOGGER = logging.getLogger("mashin")
+PROTOCOL_VERSION = 2
 logging.addLevelName(TRACE, "TRACE")
 COMMANDS = {
     "set_media",
     "prepare_next",
+    "activate_prepared",
     "clear_next",
     "play",
     "pause",
@@ -81,9 +84,7 @@ def protocol_error(code: str, message: str) -> dict[str, Any]:
 class Client:
     """Keep Control and Audio transport ownership separate from device playback."""
 
-    def __init__(
-        self, arguments: argparse.Namespace, output: Output | None = None
-    ) -> None:
+    def __init__(self, arguments: argparse.Namespace, output: Output | None = None) -> None:
         self.arguments = arguments
         self.output = output or Output(
             arguments.output_device, arguments.buffer_capacity * 1024 * 1024
@@ -97,9 +98,7 @@ class Client:
         self.ready = asyncio.Event()
         self.pong = asyncio.Event()
         self.ping_payload = b""
-        self.acks: OrderedDict[int, tuple[str, dict[str, Any], dict[str, Any]]] = (
-            OrderedDict()
-        )
+        self.acks: OrderedDict[int, tuple[str, dict[str, Any], dict[str, Any]]] = OrderedDict()
         self.last_capacity: int | None = None
         self.output_lock = asyncio.Lock()
         self.disconnected_at: float | None = None
@@ -114,9 +113,7 @@ class Client:
             await task
             raise
 
-    async def send(
-        self, kind: str, payload: dict[str, Any], *, sequence: bool = False
-    ) -> None:
+    async def send(self, kind: str, payload: dict[str, Any], *, sequence: bool = False) -> None:
         async with self.send_lock:
             if self.control is None or self.control.closed:
                 raise ConnectionError("Control disconnected")
@@ -125,15 +122,13 @@ class Client:
                 payload = {"sequence": self.sequence, **payload}
             await self.control.send_json(
                 {
-                    "protocol_version": 1,
+                    "protocol_version": PROTOCOL_VERSION,
                     "type": kind,
                     "message_id": str(uuid4()),
                     "connection_epoch": self.epoch,
                     "payload": payload,
                 },
-                dumps=lambda value: json.dumps(
-                    value, allow_nan=False, separators=(",", ":")
-                ),
+                dumps=lambda value: json.dumps(value, allow_nan=False, separators=(",", ":")),
             )
 
     def resume(self) -> dict[str, Any]:
@@ -144,6 +139,7 @@ class Client:
             **state,
             "next_revision": self.output.next_revision,
             "received_streams": self.output.cursors(),
+            "activation": asdict(self.output.activation) if self.output.activation else None,
         }
 
     async def run(self) -> None:
@@ -153,9 +149,7 @@ class Client:
             self.arguments.name,
             self.arguments.profile,
             self.output.buffer_capacity / (1024 * 1024),
-            self.arguments.output_device
-            if self.arguments.output_device is not None
-            else "default",
+            self.arguments.output_device if self.arguments.output_device is not None else "default",
         )
         delay = 0.5
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=10)
@@ -169,9 +163,7 @@ class Client:
                         aiohttp.ClientConnectorCertificateError,
                         aiohttp.WSServerHandshakeError,
                     ) as error:
-                        raise AudioError(
-                            "WebSocket upgrade or TLS verification failed"
-                        ) from error
+                        raise AudioError("WebSocket upgrade or TLS verification failed") from error
                     except (
                         aiohttp.ClientError,
                         ConnectionError,
@@ -219,9 +211,7 @@ class Client:
         tasks: list[asyncio.Task[None]] = []
         ws_timeout = aiohttp.ClientWSTimeout(ws_close=2)
         try:
-            LOGGER.info(
-                "Connecting Control to %s", urlsplit(self.arguments.server).netloc
-            )
+            LOGGER.info("Connecting Control to %s", urlsplit(self.arguments.server).netloc)
             self.control = await session.ws_connect(
                 self.arguments.server + "/mashin/v1/control",
                 autoping=False,
@@ -261,17 +251,13 @@ class Client:
                     await self.operate(self.output.stop)
                     raise ConnectionError("Server cannot resume retained playback")
                 raise AudioError("Server rejected hello: " + str(code))
-            if envelope["type"] != "welcome" or not isinstance(
-                envelope["connection_epoch"], str
-            ):
+            if envelope["type"] != "welcome" or not isinstance(envelope["connection_epoch"], str):
                 raise AudioError("Expected a welcome with a connection epoch")
             self.epoch = envelope["connection_epoch"]
             welcome = envelope["payload"]
             snapshot = self.output.snapshot()
             accepted = welcome["current_stream"]
-            if (accepted["stream"]["stream_id"] if accepted else None) != snapshot[
-                "stream_id"
-            ]:
+            if (accepted["stream"]["stream_id"] if accepted else None) != snapshot["stream_id"]:
                 raise ConnectionError("Playback changed during reconnect")
             limits = welcome["limits"]
             if (
@@ -302,9 +288,7 @@ class Client:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             sockets = [
-                connection
-                for connection in (self.audio, self.control)
-                if connection is not None
+                connection for connection in (self.audio, self.control) if connection is not None
             ]
             self.audio = self.control = None
             await asyncio.gather(
@@ -339,7 +323,7 @@ class Client:
                         "payload",
                     }
                     or type(envelope["protocol_version"]) is not int
-                    or envelope["protocol_version"] != 1
+                    or envelope["protocol_version"] != PROTOCOL_VERSION
                     or not isinstance(envelope["payload"], dict)
                     or (not welcome and envelope["connection_epoch"] != self.epoch)
                 ):
@@ -369,10 +353,7 @@ class Client:
                 LOGGER.warning("Server error: %s", payload["error"]["code"])
                 with self.output.lock:
                     for stream in (self.output.current, self.output.next):
-                        if (
-                            stream is not None
-                            and stream.identifier == payload["stream_id"]
-                        ):
+                        if stream is not None and stream.identifier == payload["stream_id"]:
                             stream.error = payload["error"]
             else:
                 raise AudioError("Unexpected Control message: " + str(kind))
@@ -394,9 +375,7 @@ class Client:
         error = None
         try:
             if kind == "set_media":
-                await self.operate(
-                    self.output.load, payload["stream"], payload["autoplay"]
-                )
+                await self.operate(self.output.load, payload["stream"], payload["autoplay"])
                 output_format = payload["stream"]["output_format"]
                 LOGGER.info(
                     "Media loaded: stream=%s, profile=%s, rate=%s Hz, channels=%s, autoplay=%s",
@@ -411,31 +390,30 @@ class Client:
                 with self.output.lock:
                     if (
                         self.output.current is None
-                        or self.output.current.identifier
-                        != payload["current_stream_id"]
+                        or self.output.current.identifier != payload["current_stream_id"]
                     ):
-                        raise AudioError(
-                            "Successor belongs to a different current stream"
-                        )
+                        raise AudioError("Successor belongs to a different current stream")
                     if (
                         self.output.next is not None
                         or payload["next_revision"] <= self.output.next_revision
                     ):
-                        raise AudioError(
-                            "A successor is already prepared or its revision is stale"
-                        )
+                        raise AudioError("A successor is already prepared or its revision is stale")
                     self.output.next = stream
                     self.output.next_revision = payload["next_revision"]
+            elif kind == "activate_prepared":
+                await self.operate(
+                    self.output.activate_prepared,
+                    payload["current_stream_id"],
+                    payload["stream_id"],
+                    payload["next_revision"],
+                )
             elif kind == "clear_next":
                 with self.output.lock:
                     if (
                         self.output.current is None
-                        or self.output.current.identifier
-                        != payload["current_stream_id"]
+                        or self.output.current.identifier != payload["current_stream_id"]
                     ):
-                        raise AudioError(
-                            "Successor already promoted or current stream changed"
-                        )
+                        raise AudioError("Successor already promoted or current stream changed")
                     self.output.next = None
                     self.output.next_revision = payload["next_revision"]
             elif kind in ("play", "pause", "stop"):
@@ -472,9 +450,21 @@ class Client:
         if len(self.acks) > 32:
             self.acks.popitem(last=False)
         await self.send("command_ack", ack)
-        LOGGER.debug(
-            "Command result: %s id=%s status=%s", kind, identifier, ack["status"]
-        )
+        LOGGER.debug("Command result: %s id=%s status=%s", kind, identifier, ack["status"])
+        if kind == "activate_prepared" and error is None:
+            receipt = self.output.activation
+            assert receipt is not None
+            snapshot = self.output.snapshot()
+            await self.send(
+                "prepared_activated",
+                {
+                    "activation": asdict(receipt),
+                    "output_revision": snapshot["output_revision"],
+                    "output_state": snapshot["output_state"],
+                    "position_frame": snapshot["position_frame"],
+                },
+                sequence=True,
+            )
         if self.ready.is_set():
             await self.capacity(force=True)
         await self.state()
@@ -494,7 +484,7 @@ class Client:
         )
         await self.audio.send_json(
             {
-                "protocol_version": 1,
+                "protocol_version": PROTOCOL_VERSION,
                 "type": "audio_hello",
                 "message_id": str(uuid4()),
                 "connection_epoch": self.epoch,
@@ -607,8 +597,7 @@ class Client:
         snapshot = self.output.snapshot()
         await self.send("player_state", snapshot, sequence=True)
         identity = tuple(
-            snapshot[key]
-            for key in ("stream_id", "output_state", "volume_percent", "is_muted")
+            snapshot[key] for key in ("stream_id", "output_state", "volume_percent", "is_muted")
         )
         if identity != self.last_state:
             LOGGER.info(
@@ -651,9 +640,7 @@ class Client:
                 events = await self.operate(self.output.poll)
                 for kind, payload in events:
                     await self.send(kind, payload, sequence=True)
-                    LOGGER.info(
-                        "Playback event: %s stream=%s", kind, payload["stream_id"]
-                    )
+                    LOGGER.info("Playback event: %s stream=%s", kind, payload["stream_id"])
                 if self.ready.is_set():
                     await self.capacity()
                 if events or time.monotonic() - last_report >= 1:
@@ -733,11 +720,7 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--buffer-capacity must be at least 1 MiB")
     if result.profile == "opus":
         result.profile = "opus_128k"
-    if (
-        not result.device_id
-        or not result.device_id.isascii()
-        or len(result.device_id) > 128
-    ):
+    if not result.device_id or not result.device_id.isascii() or len(result.device_id) > 128:
         parser.error("--device-id must be 1..128 ASCII characters")
     if result.output_device is not None and result.output_device.isdecimal():
         result.output_device = int(result.output_device)
@@ -747,11 +730,7 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
 def main() -> None:
     options = arguments()
     logging.basicConfig(
-        level=TRACE
-        if options.trace
-        else logging.DEBUG
-        if options.debug
-        else logging.INFO,
+        level=TRACE if options.trace else logging.DEBUG if options.debug else logging.INFO,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
     if options.list_devices:
