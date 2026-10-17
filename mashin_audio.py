@@ -8,6 +8,7 @@ import struct
 import threading
 import time
 from collections import deque
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
@@ -112,7 +113,9 @@ def stream_from(descriptor: dict[str, Any]) -> Stream:
     return Stream(descriptor)
 
 
-def parse_chunk(data: bytes, stream: Stream, *, validate_order: bool = True) -> EncodedChunk:
+def parse_chunk(
+    data: bytes, stream: Stream, *, validate_order: bool = True
+) -> EncodedChunk:
     """Validate chunk framing without decoding or changing the receipt cursor."""
     if not HEADER.size < len(data) <= HEADER.size + MAX_PAYLOAD:
         raise AudioError("Invalid audio message length")
@@ -168,7 +171,9 @@ def decode_chunk(data: bytes, stream: Stream, *, validate_order: bool = True) ->
     pcm = np.concatenate(frames).astype(np.float32, copy=False)
     if not np.isfinite(pcm).all():
         raise AudioError("Non-finite audio samples")
-    return Chunk(encoded.stream_id, encoded.index, encoded.first, count, encoded.final, pcm)
+    return Chunk(
+        encoded.stream_id, encoded.index, encoded.first, count, encoded.final, pcm
+    )
 
 
 @dataclass(frozen=True)
@@ -177,7 +182,7 @@ class PreparedActivation:
 
     previous_stream_id: str
     stream_id: str
-    next_revision: int
+    media_revision: int
     previous_position_frame: int
 
 
@@ -190,7 +195,9 @@ class Output:
         buffer_capacity: int = DEFAULT_BUFFER_CAPACITY,
     ) -> None:
         if buffer_capacity < HEADER.size + MAX_PAYLOAD:
-            raise AudioError("Chunk buffer must hold at least one maximum-size audio message")
+            raise AudioError(
+                "Chunk buffer must hold at least one maximum-size audio message"
+            )
         self.device = device
         self.buffer_capacity = buffer_capacity
         self.lock = threading.RLock()
@@ -199,7 +206,8 @@ class Output:
         self.decoder_stopping = False
         self.current: Stream | None = None
         self.next: Stream | None = None
-        self.next_revision = 0
+        self.media_revision = 0
+        self.announcement: tuple[Any, ...] | None = None
         self.activation: PreparedActivation | None = None
         self.playing = False
         self.volume = 100
@@ -240,24 +248,101 @@ class Output:
                 self.decoder.start()
             self.condition.notify_all()
 
-    def load(self, descriptor: dict[str, Any], autoplay: bool) -> None:
-        stream = stream_from(descriptor)
+    def set_media(
+        self,
+        current: dict[str, Any] | None,
+        prepared: dict[str, Any] | None,
+        media_revision: int,
+        initial_output_state: str,
+    ) -> None:
+        """Atomically register the complete authorized A/B state by stream identity."""
+        announcement = deepcopy((current, prepared, initial_output_state))
+        with self.condition:
+            if (
+                type(media_revision) is not int
+                or not 1 <= media_revision <= 9007199254740991
+            ):
+                raise AudioError("Invalid media revision")
+            if (
+                media_revision == self.media_revision
+                and announcement == self.announcement
+            ):
+                return
+            if media_revision <= self.media_revision:
+                raise AudioError("Stale or changed media revision")
+            if initial_output_state not in ("playing", "paused") or (
+                current is None and prepared is not None
+            ):
+                raise AudioError("Invalid complete media state")
+            cached = {
+                stream.identifier: stream
+                for stream in (self.current, self.next)
+                if stream is not None
+            }
+            targets: list[Stream | None] = []
+            for descriptor in announcement[:2]:
+                if descriptor is None:
+                    targets.append(None)
+                    continue
+                stream = stream_from(descriptor)
+                previous = cached.get(stream.identifier)
+                if previous is not None and previous.descriptor != descriptor:
+                    raise AudioError(
+                        "Stream descriptor changed under the same identity"
+                    )
+                targets.append(previous or stream)
+            target, successor = targets
+            if target is not None and target is successor:
+                raise AudioError(
+                    "Current and prepared require distinct stream identities"
+                )
+            previous = self.current
+            should_reset = target is not previous
+            if (
+                should_reset
+                and target is not None
+                and target.next_index > 1
+                and (not target.chunks or target.chunks[0].index != 1)
+            ):
+                raise AudioError("Restart chunk is no longer cached")
+            activation = None
+            if target is self.next and target is not None and previous is not None:
+                activation = PreparedActivation(
+                    previous.identifier,
+                    target.identifier,
+                    self.media_revision,
+                    previous.position,
+                )
+            if not should_reset:
+                self.current, self.next = target, successor
+                self.media_revision = media_revision
+                self.announcement = announcement
+                self.condition.notify_all()
+                return
         self._stop_decoder()
         self.close_device()
         with self.lock:
-            self.current, self.next = stream, None
-            self.next_revision = 0
-            self.activation = None
-            self.playing = autoplay
+            self.current, self.next = target, successor
+            self.media_revision = media_revision
+            self.announcement = announcement
+            self.activation = activation
+            self.playing = target is not None and initial_output_state == "playing"
             self.scheduled.clear()
             self.failure = None
+            if target is not None:
+                target.decoded.clear()
+                target.decoded_index = target.position = target.rendered = 0
+                target.ended = False
         try:
-            self._open(stream)
+            if target is not None:
+                self._open(target)
         except sd.PortAudioError, ValueError:
             self.stop()
             raise
 
-    def activate_prepared(self, current_stream_id: str, stream_id: str, next_revision: int) -> None:
+    def activate_prepared(
+        self, current_stream_id: str, stream_id: str, media_revision: int
+    ) -> None:
         """Consume the exact successor grant without replacing its encoded cache."""
         with self.lock:
             if (
@@ -266,7 +351,7 @@ class Output:
                 and self.current.identifier == stream_id
                 and self.activation.previous_stream_id == current_stream_id
                 and self.activation.stream_id == stream_id
-                and self.activation.next_revision == next_revision
+                and self.activation.media_revision == media_revision
             ):
                 return
             current, successor = self.current, self.next
@@ -275,7 +360,7 @@ class Output:
                 or current.identifier != current_stream_id
                 or successor is None
                 or successor.identifier != stream_id
-                or self.next_revision != next_revision
+                or self.media_revision != media_revision
                 or successor.error is not None
             ):
                 raise AudioError("Stale prepared activation")
@@ -285,11 +370,11 @@ class Output:
             if (
                 self.current is not current
                 or self.next is not successor
-                or self.next_revision != next_revision
+                or self.media_revision != media_revision
             ):
                 raise AudioError("Prepared activation was superseded")
             self.activation = PreparedActivation(
-                current_stream_id, stream_id, next_revision, current.position
+                current_stream_id, stream_id, media_revision, current.position
             )
             self.current, self.next = successor, None
             self.playing = True
@@ -303,7 +388,6 @@ class Output:
         with self.lock:
             self.current = self.next = None
             self.playing = False
-            self.next_revision = 0
             self.activation = None
             self.scheduled.clear()
 
@@ -333,13 +417,17 @@ class Output:
     def buffered_bytes(self) -> int:
         with self.lock:
             return sum(
-                stream.buffered_bytes for stream in (self.current, self.next) if stream is not None
+                stream.buffered_bytes
+                for stream in (self.current, self.next)
+                if stream is not None
             )
 
     def buffer_stats(self) -> tuple[int, int, float]:
         """Return cached wire bytes, chunk count and remaining output duration."""
         with self.lock:
-            streams = [stream for stream in (self.current, self.next) if stream is not None]
+            streams = [
+                stream for stream in (self.current, self.next) if stream is not None
+            ]
             chunks = sum(len(stream.chunks) for stream in streams)
             seconds = sum(
                 sum(
@@ -397,9 +485,13 @@ class Output:
                         "retry_after_millis": None,
                     }
                     stream.chunks = deque(
-                        chunk for chunk in stream.chunks if chunk.index <= stream.decoded_index
+                        chunk
+                        for chunk in stream.chunks
+                        if chunk.index <= stream.decoded_index
                     )
-                    stream.buffered_bytes = sum(len(chunk.data) for chunk in stream.chunks)
+                    stream.buffered_bytes = sum(
+                        len(chunk.data) for chunk in stream.chunks
+                    )
                     self.condition.notify_all()
             LOGGER.error(
                 "Buffered chunk decode failed: stream=%s index=%s: %s",
@@ -443,7 +535,9 @@ class Output:
         while True:
             with self.condition:
                 self.condition.wait_for(
-                    lambda: self.decoder_stopping or self._decode_candidate() is not None
+                    lambda: (
+                        self.decoder_stopping or self._decode_candidate() is not None
+                    )
                 )
                 if self.decoder_stopping:
                     return
@@ -521,7 +615,10 @@ class Output:
                 stream.ended = True
                 events.append(("track_ended", {"stream_id": stream.identifier}))
             promote = (
-                self.playing and stream.ended and self.next is not None and bool(self.next.chunks)
+                self.playing
+                and stream.ended
+                and self.next is not None
+                and bool(self.next.chunks)
             )
         if promote:
             self.close_device()
@@ -536,7 +633,7 @@ class Output:
                         "track_started",
                         {
                             "stream_id": stream.identifier,
-                            "next_revision": self.next_revision,
+                            "media_revision": self.media_revision,
                             "output_revision": 0,
                             "position_frame": 0,
                         },
@@ -545,7 +642,9 @@ class Output:
             self._open(stream)
         return events
 
-    def _callback(self, output: np.ndarray, count: int, clock: Any, status: Any) -> None:
+    def _callback(
+        self, output: np.ndarray, count: int, clock: Any, status: Any
+    ) -> None:
         output.fill(0)
         with self.condition:
             stream = self.current
@@ -557,7 +656,9 @@ class Output:
                 offset = stream.rendered - chunk.first
                 take = min(count - cursor, chunk.count - offset)
                 gain = 0.0 if self.muted else self.volume / 100.0
-                output[cursor : cursor + take] = chunk.pcm[offset : offset + take] * gain
+                output[cursor : cursor + take] = (
+                    chunk.pcm[offset : offset + take] * gain
+                )
                 self.scheduled.append(
                     (
                         clock.outputBufferDacTime + cursor / stream.rate,
