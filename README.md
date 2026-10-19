@@ -1,12 +1,12 @@
 # mashin-py-cli
 
-Minimal Python console receiver for the Music Assistant **Mashin** player provider.
+Minimal Python console receiver for the Music Assistant **Mashin Stream** player provider.
 Audio plays on the system's default output device. Select media and control the
 registered player in Music Assistant; there are no local playback controls.
 
 ## Install and Run
 
-Requires Python 3.12+ and a Music Assistant server with the Mashin provider enabled.
+Requires Python 3.12+ and a Music Assistant server with the Mashin Stream provider enabled.
 The client uses Mashin control protocol V3. Update the provider and all clients
 together. Each revision describes both authorized media slots; unchanged stream
 identities retain their encoded cache and receipt cursor, including a successor
@@ -75,7 +75,8 @@ buffer runs out; missing data is not treated as a natural track end.
 Successor tracks are supported,
 but device reopening between tracks is not guaranteed gapless.
 
-The Mashin endpoints are token-free and intended for a trusted LAN. Do not expose
+The `/mashin-stream/v3/control` and `/mashin-stream/v3/audio` endpoints are token-free
+and intended for a trusted LAN. Do not expose
 them directly to the Internet. WSS requires TLS on MA's existing webserver or proxy.
 On Linux, install PortAudio if unavailable (for example `libportaudio2` on Debian).
 The client uses PyAV's codec libraries; a separate FFmpeg executable is not required

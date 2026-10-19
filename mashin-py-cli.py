@@ -224,7 +224,7 @@ class Client:
                 "Connecting Control to %s", urlsplit(self.arguments.server).netloc
             )
             self.control = await session.ws_connect(
-                self.arguments.server + "/mashin/v1/control",
+                self.arguments.server + "/mashin-stream/v3/control",
                 autoping=False,
                 max_msg_size=65536,
                 timeout=ws_timeout,
@@ -506,7 +506,7 @@ class Client:
     ) -> None:
         LOGGER.debug("Connecting Audio channel")
         self.audio = await session.ws_connect(
-            self.arguments.server + "/mashin/v1/audio",
+            self.arguments.server + "/mashin-stream/v3/audio",
             autoping=False,
             max_msg_size=HEADER.size + MAX_PAYLOAD,
             timeout=timeout,

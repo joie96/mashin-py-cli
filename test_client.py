@@ -827,8 +827,8 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
         self.hellos = []
         self.epoch = str(uuid4())
         app = web.Application()
-        app.router.add_get("/mashin/v1/control", self.control_handler)
-        app.router.add_get("/mashin/v1/audio", self.audio_handler)
+        app.router.add_get("/mashin-stream/v3/control", self.control_handler)
+        app.router.add_get("/mashin-stream/v3/audio", self.audio_handler)
         self.server = TestServer(app)
         await self.server.start_server()
         self.client = client_module.Client(
